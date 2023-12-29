@@ -1,0 +1,267 @@
+---
+title: "de_rna-seq"
+author: "Ostap Kalapun"
+date: "2023-11-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE)
+knitr::opts_knit$set(root.dir='C:/Users/user/differential-expression_rna-seq')
+setwd('C:/Users/user/differential-expression_rna-seq')
+getwd()
+```
+
+# Author information
+
+Name: Ostap Kalapun
+
+Affiliation: undergraduate student
+
+E-mail: uzya03@gmail.com
+
+# Research overview
+
+I'm going to reanalyze the study by *Schlotawa L, Tyka K, Kettwig M, Ahrens-Nicklas RC et al. Drug screening identifies tazarotene and bexarotene as therapeutic agents in multiple sulfatase deficiency. EMBO Mol Med 2023 Mar 8;15(3):e14837. PMID: 36789546*
+
+The research explored treatments to Multiple sulfatase deficiency (MSD) disease, caused by the mutation in the SUMF1 gene, that results in an inability to breakdown sulfated substances. Out of all 785 tested drugs only 13 surpassed the baseline.
+
+This, several experiments conducted transcriptome and pathway analysis. My focus is at the one of finding specific genes that are responsible for restoring sulfatase activity. 
+The experiment included 7 different fibroblast lines that were treated with tazarotene (increases expression of retinoids genes and increases sulfatase activities), adapalene (increases expression of retinoids genes but doesn't increase sulfatase activities), and DMSO (control group, base compound of all drugs).
+
+The reads were sequenced using an RNA depletion technique.
+
+
+```{r libs, include=FALSE}
+### Bioconductor and CRAN libraries used
+library(htmltools)
+library(tidyverse)
+library(readr)
+library(tidyr)
+library(stringr)
+library(AnnotationHub)
+library(ensembldb)
+library(RColorBrewer)
+library(biomaRt)
+library(ashr)
+library(EnhancedVolcano)
+library(fgsea)
+library(plotly)
+
+library(DESeq2)
+library(pheatmap)
+library(DEGreport)
+library(tximport)
+library(ggplot2) 
+library(ggrepel)
+library(knitr)
+library(PCAtools)
+
+library(ggplotify)
+library(writexl)
+
+ggplot2::theme_set(theme_light(base_size=14))
+
+opts_chunk[["set"]](
+    cache=FALSE,
+    dev=c("png", "pdf"),
+    error=TRUE,
+    highlight=TRUE,
+    message=FALSE,
+    prompt=FALSE,
+    tidy=FALSE,
+    warning=FALSE)
+
+```
+
+# Retrieving the data
+
+## Load the counts
+```{r load_counts}
+# raw counts downloaded from GEO
+# https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE205555
+
+counts_csv <- "tables/counts.csv"
+if (file.exists(counts_csv)){
+    counts <- read.csv(counts_csv)
+}else{ # this chunk extracts counts and then normalizes them with TPM method if they aren't already organized into .csv-files
+    # read counts files for every sample (2 columns - gene ID and its expression count)
+    files <- fs::dir_ls(path="../data/input_geo", glob="*exonCounts.txt")
+    # create a tibble out of the raw files
+    counts <- readr::read_tsv(files, id="path", col_names=c("ensembl_gene_id", "raw_counts"))
+    df_split <- str_split_fixed(counts$path, "_", 13) %>% as.data.frame()
+    counts$sample <- df_split$V2 
+    counts <- counts %>% 
+        mutate(sample=str_replace(sample, "geo/", "")) %>% 
+        dplyr::relocate(sample) %>% dplyr::select(-path) %>% 
+        pivot_wider(names_from="sample", values_from="raw_counts")
+    
+    # save raw organized counts to .csv-file
+    write_csv(counts, counts_csv)
+    counts <- counts %>% column_to_rownames("ensembl_gene_id")
+}
+```
+
+## Load the metadata
+```{r load_metadata}
+# the metadata table was parsed from the GEO accession webpage by taking the sample's ID and name preview
+metadata <- read.csv("tables/metadata.csv", row.names = 1)
+```
+
+
+## Gene annotation
+```{r biomaRt}
+ensembl <- useMart("ensembl", dataset="hsapiens_gene_ensembl")
+
+# get genes info via biomaRts
+biomart_list <- getBM(filter="ensembl_gene_id", 
+                      attributes=c("ensembl_gene_id", 
+                                     "hgnc_symbol", 
+                                     "transcript_biotype", 
+                                     "description"),
+                      values=counts$ensembl_gene_id, mart=ensembl)
+
+# we subset only protein coding genes and miRNA
+biomart_list_filtered <- biomart_list %>% dplyr::filter(transcript_biotype %in% c("protein_coding",
+                                                                                  "miRNA"))
+# select counts corresponding to retrieved biomaRt list
+counts_filtered <- counts %>% dplyr::filter(ensembl_gene_id %in% biomart_list_filtered$ensembl_gene_id)
+
+write.csv(counts_filtered, "tables/counts_filtered.csv", row.names=FALSE)
+write.csv(biomart_list_filtered, "tables/gene_names_mapped.csv", row.names=FALSE)
+```
+
+## Normalization
+```{r normalization}
+counts_filtered <- counts_filtered %>% tibble::column_to_rownames("ensembl_gene_id")
+# here we perform differential expression analysis in order to calculate
+# overall mean expression levels of genes;
+# the design formula implies that we created an intercept-only model
+dds <- DESeqDataSetFromMatrix(countData=counts_filtered, 
+                              colData=metadata,
+                              design=~1)
+# normalization of the counts with the variance stabilizing transformation
+counts_filtered_vst <- vst(dds, blind=TRUE) %>% assay() %>% as.data.frame()
+```
+
+# Exploratory data analysis
+## PCA
+```{r pca, echo=FALSE}
+pca_calculated <- pca(counts_filtered_vst, metadata=metadata, removeVar=0.1)
+```
+### For fibroblast_line factor
+```{r pca-fibroblast_line}
+biplot(pca_calculated, colby="fibroblast_line", legendPosition="right", lab=NULL)
+```
+
+We see that samples from the line E are distant from the other lines, as well as the line A, which might be a signal that they have a different expression profile. Let alone that some samples are far away from their main cluster. There's a slight chance that these samples are outliers. In general, all other lines are in the vicinity and the samples inside each fibroblast line are, essentially, clustered together with slight sparseness. That's a good sign, which means that the samples were handled correctly during the experiment and have the same expression across the samples.
+
+### For treatment factor
+```{r pca-treatment}
+biplot(pca_calculated, colby="treatment", legendPosition="right", lab=NULL)
+```
+
+The situation with treatment is much more interesting. Treatments are scattered around the plot but we can clearly see that they still clustered together, unlike the DMSO samples. This suggests that the drugs really contribute to changing expression profile in the cell so it's worth analyzing further results.
+
+## Heatmap (Hierarchial clustering by samples)
+
+```{r heatmap}
+matrix_correlations <- cor(counts_filtered_vst)
+
+f1 <- pheatmap(matrix_correlations, 
+               annotation=metadata, 
+               show_rownames=FALSE,
+               show_colnames=FALSE)
+```
+
+From the graph above it's evident that samples from the line F are more similar to samples from the line G than to those from, say, A, C, or E. Also, the replicates are distributed equally acrosss each fibroblast line as it was due (that's great, we don't have any bias in that way).
+
+# Differential expression analysis
+I apply the Wald significance test in this experiment because we aim to observe paired comparisons between groups, in this case, fibroblast lines and treatments, which is shown by the design formula.
+```{r dds-test}
+dds <- DESeqDataSetFromMatrix(countData=counts_filtered, 
+                              colData=metadata,
+                              design=~fibroblast_line+treatment)
+
+dds_tested <- DESeq(dds, test="Wald")
+```
+
+```{r dds-test-result}
+genes_mapped <- read.csv("tables/gene_names_mapped.csv")
+
+# lfcShrink scales log2FoldChanges to attenuate the expression of genes with imprecise fold changes 
+res_tazarotene_adapalene <- lfcShrink(dds_tested,
+                                      type="ashr",
+                                      contrast=c("treatment", "tazarotene", "adapalene")) %>% as.data.frame() %>% tibble::rownames_to_column("gene")
+tmp <- genes_mapped %>% dplyr::filter(ensembl_gene_id %in% res_tazarotene_adapalene$gene) %>% dplyr::rename(gene=ensembl_gene_id)
+
+res_tazarotene_adapalene_significant <- left_join(res_tazarotene_adapalene, tmp, by="gene") %>% dplyr::select(-gene) %>% dplyr::rename(gene=hgnc_symbol)
+
+results <- res_tazarotene_adapalene_significant %>% distinct(gene, .keep_all = TRUE)
+
+results_top <- results[order(results$padj),][1:1000,]
+results_top$diff_expressed <- ifelse(results_top$log2FoldChange > 1, "UP", ifelse(results_top$log2FoldChange < -1, "DOWN", "NO"))
+results_top$diff_expressed <- as.factor(results_top$diff_expressed)
+
+volcano <- ggplot(data=results_top, 
+                  aes(x=log2FoldChange, 
+                      y=-log10(padj), 
+                      col=diff_expressed, 
+                      label=gene)) + 
+          geom_point() +
+          theme_minimal() +
+          scale_color_manual(values=c("brown2", "grey", "chartreuse3")) +
+          labs(title="Tazarotene vs Adapalene") +
+          geom_text_repel() +
+          geom_vline(xintercept=c(-1, 1), col="black", linetype="dotted") +
+          geom_hline(yintercept=-log10(0.01), col="black", linetype="dotted")
+
+ggplotly(volcano)
+
+EnhancedVolcano(res_tazarotene_adapalene_significant,
+                lab = res_tazarotene_adapalene_significant$gene,
+                x = "log2FoldChange",
+                y = "padj",
+                title = "Tazaroten vs Adapalene",
+                pCutoff = 0.01,
+                FCcutoff = 1,
+                ylim = c(-2, 15))
+```
+
+I had to lower log2FoldChange conventional thresholds to -1 and 1, which is still appropriate. The reason for this might be overall log2FoldChange shrinkage step. Thus, we found that there're 5 significantly expressed genes, out of which 3 are downregulated (KRT17, CLDN1, FLG) and 2 are upregulated (H2BC14, AKR1B10).
+
+# Functional analysis
+```{r fgsea}
+# loaded the Hallmark database
+hallmark <- gmtPathways("tables/h.all.v2023.1.Hs.symbols.gmt")
+tazarotene_adapalene <- results %>% dplyr::filter(!is.na(padj)) %>% dplyr::filter(!is.na(log2FoldChange))
+
+# I ranked genes with the log2FoldChange*abs(-log10(padj)) ranking system
+ranked <- tazarotene_adapalene %>% mutate(rank=(log2FoldChange * abs(-log10(padj)))) %>% 
+  dplyr::select(gene, rank) %>% tibble::deframe()
+
+# then I searched for pathways in the Hallmark database that correspond to the genes with the highest normalized enrichment score
+fgsea_res <- fgsea(pathways=hallmark, stats=ranked)
+fgsea_res %>% dplyr::filter(padj<0.25) %>% arrange(desc(NES))
+```
+As a result of performing fast gene set enrichment analysis, I obtained 8 potential pathway functions that are associated with the expressed genes. They are:
+- Interferon-alpha response (immune response marker)
+- Bile acids methabolism
+- Interferon gamma response (immune response marker)
+- Glycolysis (glucose break down)
+- Heme metabolism (oxygen-carrying marker)
+- P53 pathway (stress signals marker)
+- Hypoxia (can't provide sufficient amount of oxygen to maintain homeostasis)
+- Wnt/beta-catenin signaling (maintains cellular homeostasis)
+
+# Conclusion
+The upregulation of genes involved in the interferon-alpha and interferon-gamma responses indicates an immune response in MSD. This activation may reflect the cellular stress due to the accumulation of sulfatides.
+
+Low oxygen conditions, related to P53 pathway and Heme metabolism, can also be a response to metabolic stress.
+
+The downregulation of genes like KRT17 (keratin 17), CLDN1 (claudin 1), and FLG (filaggrin) can impact cell barrier function, which could be relevant. On the other hand, the upregulation of H2BC14 (a histone gene) and AKR1B10 (an enzyme involved in detoxification) might show us that the cells attempt to cope with increased stress and the need for tissue repair and protection.
+
+
+```{r sys-info}
+sessionInfo()
+```
